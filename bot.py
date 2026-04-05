@@ -337,12 +337,15 @@ def _build_welcome_text(template: str, member, chat) -> str:
     except Exception:
         pass
 
-    return (template
-            .replace("{name}",     f"[{name}](tg://user?id={member.id})")
-            .replace("{username}", username)
-            .replace("{id}",       user_id)
-            .replace("{group}",    group)
-            .replace("{count}",    count))
+    result = template
+    result = result.replace("@{username}", username)
+    result = result.replace("{username}",  username)
+    result = result.replace("{name}",      f"[{name}](tg://user?id={member.id})")
+    result = result.replace("{user_id}",   user_id)
+    result = result.replace("{id}",        user_id)
+    result = result.replace("{group}",     group)
+    result = result.replace("{count}",     count)
+    return result
 
 def new_member(update: Update, context: CallbackContext):
     try:
@@ -422,7 +425,7 @@ def setwelcome(update: Update, context: CallbackContext):
                 "Usage:\n"
                 "`/setwelcome Hello {name}!` – text welcome\n"
                 "`/setwelcome off` – disable welcome\n\n"
-                "Placeholders: `{name}` `{username}` `{id}` `{group}` `{count}`\n"
+                "Placeholders: `{name}` `{username}` `{id}` or `{user_id}` `{group}` `{count}`\n"
                 "Reply to a photo/video while using this command to set media welcome."
             )
             return
@@ -907,7 +910,7 @@ def help_cmd(update: Update, context: CallbackContext):
             "`/study_mode on|off` – Toggle study mode\n"
             "`/setwelcome <msg>` – Set welcome\n"
             "`/setwelcome off` – Disable welcome\n"
-            "_Placeholders: {name} {username} {id} {group} {count}_\n"
+            "_Placeholders: {name} {username} {id} {user\\_id} {group} {count}_\n"
             "_Reply to photo/video to attach media_\n\n"
             "`/filter word [reply]` – Add text filter\n"
             "`/filtersticker word` – Add sticker filter _(reply to sticker)_\n"
