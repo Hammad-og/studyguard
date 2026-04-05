@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-📚 StudyGuard Bot v3.1 - Crash-resistant build
+📚 StudyGuard Bot v4.0 - Rose Edition
 Compatible with python-telegram-bot 13.15
-Works in ALL group types: normal, supergroups, topic/forum groups
+Fixes: setwelcome, unwarn, sticker filters, welcome video/username/id
+New: /afk, AFK auto-detection, rich welcome with video/photo, section-divided topics
 """
 
 import os
@@ -13,10 +14,12 @@ import time
 from datetime import datetime, timedelta
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, ParseMode
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ChatPermissions, ParseMode
 )
 from telegram.error import (
-    TelegramError, Unauthorized, BadRequest, TimedOut, NetworkError, ChatMigrated, RetryAfter
+    TelegramError, Unauthorized, BadRequest,
+    TimedOut, NetworkError, ChatMigrated, RetryAfter
 )
 from telegram.ext import (
     Updater, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -33,12 +36,14 @@ logger = logging.getLogger(__name__)
 #  DATA STORE
 # ─────────────────────────────────────────────
 data = {
-    "warns":        {},
-    "study_mode":   {},
-    "welcome_msgs": {},
-    "filters":      {},
-    "points":       {},
-    "user_names":   {},
+    "warns":        {},   # {chat_id: {user_id: count}}
+    "study_mode":   {},   # {chat_id: bool}
+    "welcome_msgs": {},   # {chat_id: {"text": str, "media": str|None, "media_type": "photo"|"video"|None}}
+    "welcome_off":  {},   # {chat_id: bool}
+    "filters":      {},   # {chat_id: {keyword: {"response": str|None, "is_sticker": bool, "sticker_id": str|None}}}
+    "points":       {},   # {chat_id: {user_id: int}}
+    "user_names":   {},   # {user_id: str}
+    "afk":          {},   # {user_id: {"reason": str, "time": str}}
 }
 
 DATA_FILE = "studybot_data.json"
@@ -52,19 +57,19 @@ def load_data():
                 for k in data:
                     if k in loaded:
                         data[k] = loaded[k]
-            logger.info("Data loaded successfully.")
+            logger.info("Data loaded.")
         except Exception as e:
-            logger.error(f"Failed to load data: {e}")
+            logger.error(f"load_data: {e}")
 
 def save_data():
     try:
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        logger.error(f"Failed to save data: {e}")
+        logger.error(f"save_data: {e}")
 
 # ─────────────────────────────────────────────
-#  NON-STUDY PATTERNS
+#  STUDY DETECTION
 # ─────────────────────────────────────────────
 NON_STUDY_PATTERNS = [
     r"^\s*(hi|hello|hey|hii+|helo|sup|yo)\s*[!.]*\s*$",
@@ -75,22 +80,22 @@ NON_STUDY_PATTERNS = [
 ]
 
 STUDY_KEYWORDS = [
-    "help", "question", "doubt", "explain", "how", "what", "why", "when",
-    "where", "problem", "solve", "answer", "exam", "test", "notes", "study",
-    "homework", "assignment", "lecture", "concept", "formula", "definition",
-    "chapter", "topic", "revision", "practice", "pdf", "book", "link",
-    "resource", "material", "class", "quiz"
+    "help","question","doubt","explain","how","what","why","when",
+    "where","problem","solve","answer","exam","test","notes","study",
+    "homework","assignment","lecture","concept","formula","definition",
+    "chapter","topic","revision","practice","pdf","book","link",
+    "resource","material","class","quiz"
 ]
 
 def is_non_study_msg(text: str) -> bool:
-    text_lower = text.lower().strip()
+    t = text.lower().strip()
     for kw in STUDY_KEYWORDS:
-        if kw in text_lower:
+        if kw in t:
             return False
-    for pattern in NON_STUDY_PATTERNS:
-        if re.match(pattern, text_lower, re.IGNORECASE):
+    for p in NON_STUDY_PATTERNS:
+        if re.match(p, t, re.IGNORECASE):
             return True
-    if len(text.split()) <= 3 and not any(kw in text_lower for kw in STUDY_KEYWORDS):
+    if len(text.split()) <= 3 and not any(kw in t for kw in STUDY_KEYWORDS):
         if not any(c.isdigit() for c in text):
             return True
     return False
@@ -110,12 +115,12 @@ def add_points(chat_id: str, user_id: str, pts: int = 1):
     data["points"][chat_id][user_id] = data["points"][chat_id].get(user_id, 0) + pts
 
 def is_admin(update: Update, context: CallbackContext, user_id: int = None) -> bool:
-    uid_check = user_id or update.effective_user.id
+    uid = user_id or update.effective_user.id
     try:
-        member = context.bot.get_chat_member(update.effective_chat.id, uid_check)
-        return member.status in ("administrator", "creator")
+        m = context.bot.get_chat_member(update.effective_chat.id, uid)
+        return m.status in ("administrator", "creator")
     except Exception as e:
-        logger.warning(f"is_admin check failed: {e}")
+        logger.warning(f"is_admin: {e}")
         return False
 
 def admin_only(update: Update, context: CallbackContext) -> bool:
@@ -125,95 +130,81 @@ def admin_only(update: Update, context: CallbackContext) -> bool:
     return True
 
 def user_mention(user) -> str:
-    name = (user.first_name or "User").replace("[", "").replace("]", "")
+    name = (user.first_name or "User").replace("[","").replace("]","")
     return f"[{name}](tg://user?id={user.id})"
 
-def safe_reply(update: Update, text: str, **kwargs):
-    """Send a reply safely — catches all Telegram errors."""
+def get_thread_id(update: Update):
+    chat = update.effective_chat
+    msg  = update.effective_message
+    if getattr(chat, "is_forum", False):
+        return getattr(msg, "message_thread_id", None)
+    return None
+
+def safe_reply(update: Update, text: str, reply_markup=None, **kwargs):
     try:
+        msg = update.effective_message
         chat = update.effective_chat
-        message = update.effective_message
-        is_forum = getattr(chat, "is_forum", False)
-        thread_id = getattr(message, "message_thread_id", None) if is_forum else None
-
-        send_kwargs = {"parse_mode": ParseMode.MARKDOWN, **kwargs}
-        if thread_id:
-            send_kwargs["message_thread_id"] = thread_id
-
-        if is_forum and thread_id:
-            chat.send_message(text=text, **send_kwargs)
+        thread_id = get_thread_id(update)
+        kw = {"parse_mode": ParseMode.MARKDOWN}
+        if reply_markup:
+            kw["reply_markup"] = reply_markup
+        if thread_id and getattr(chat, "is_forum", False):
+            kw["message_thread_id"] = thread_id
+            chat.send_message(text=text, **kw)
         else:
-            message.reply_text(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
+            msg.reply_text(text, **kw)
     except RetryAfter as e:
-        logger.warning(f"Rate limited. Sleeping {e.retry_after}s")
         time.sleep(e.retry_after + 1)
     except (Unauthorized, BadRequest) as e:
-        logger.warning(f"safe_reply error (non-fatal): {e}")
-    except TelegramError as e:
-        logger.error(f"safe_reply TelegramError: {e}")
+        logger.warning(f"safe_reply: {e}")
     except Exception as e:
-        logger.error(f"safe_reply unexpected error: {e}")
+        logger.error(f"safe_reply: {e}")
 
 def safe_delete(message):
-    """Delete a message safely."""
     try:
         message.delete()
-    except (BadRequest, Unauthorized) as e:
-        logger.warning(f"Could not delete message: {e}")
-    except TelegramError as e:
-        logger.warning(f"safe_delete TelegramError: {e}")
     except Exception as e:
-        logger.warning(f"safe_delete unexpected: {e}")
+        logger.warning(f"safe_delete: {e}")
 
 def safe_send(context: CallbackContext, chat_id, text: str, thread_id=None, **kwargs):
-    """Send a new message safely."""
     try:
-        send_kwargs = {"parse_mode": ParseMode.MARKDOWN, **kwargs}
+        kw = {"parse_mode": ParseMode.MARKDOWN, **kwargs}
         if thread_id:
-            send_kwargs["message_thread_id"] = thread_id
-        return context.bot.send_message(chat_id=chat_id, text=text, **send_kwargs)
+            kw["message_thread_id"] = thread_id
+        return context.bot.send_message(chat_id=chat_id, text=text, **kw)
     except RetryAfter as e:
-        logger.warning(f"Rate limited. Sleeping {e.retry_after}s")
         time.sleep(e.retry_after + 1)
-    except (Unauthorized, BadRequest) as e:
-        logger.warning(f"safe_send error (non-fatal): {e}")
-    except TelegramError as e:
-        logger.error(f"safe_send TelegramError: {e}")
     except Exception as e:
-        logger.error(f"safe_send unexpected error: {e}")
+        logger.error(f"safe_send: {e}")
     return None
 
 # ─────────────────────────────────────────────
-#  ERROR HANDLER (global)
+#  ERROR HANDLER
 # ─────────────────────────────────────────────
 def error_handler(update: object, context: CallbackContext):
-    """Global error handler — logs everything without crashing."""
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
-        logger.warning(f"Network/timeout error (will retry): {err}")
+        logger.warning(f"Network/timeout: {err}")
     elif isinstance(err, RetryAfter):
-        logger.warning(f"Rate limited: retry after {err.retry_after}s")
+        logger.warning(f"Rate limited: {err.retry_after}s")
     elif isinstance(err, ChatMigrated):
-        logger.info(f"Chat migrated to supergroup: {err.new_chat_id}")
+        logger.info(f"Chat migrated: {err.new_chat_id}")
     elif isinstance(err, Unauthorized):
-        logger.info(f"Unauthorized (bot removed or blocked): {err}")
+        logger.info(f"Unauthorized: {err}")
     elif isinstance(err, BadRequest):
         logger.warning(f"BadRequest: {err}")
     else:
-        logger.error(f"Unhandled error: {err}", exc_info=context.error)
+        logger.error(f"Unhandled: {err}", exc_info=context.error)
 
 # ─────────────────────────────────────────────
 #  /start
 # ─────────────────────────────────────────────
 def start(update: Update, context: CallbackContext):
     try:
-        bot_username = context.bot.username
-        keyboard = [
+        bu = context.bot.username
+        kb = [
             [
-                InlineKeyboardButton(
-                    "➕ Add to Any Group",
-                    url=f"https://t.me/{bot_username}?startgroup=true&admin=delete_messages+restrict_members+ban_users"
-                ),
+                InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{bu}?startgroup=true&admin=delete_messages+restrict_members+ban_users"),
                 InlineKeyboardButton("📖 Commands", callback_data="show_commands"),
             ],
             [
@@ -222,22 +213,20 @@ def start(update: Update, context: CallbackContext):
             ],
         ]
         text = (
-            "📚 *Welcome to StudyGuard Bot!*\n\n"
-            "I work in *all Telegram group types*:\n"
-            "✅ Normal groups\n"
-            "✅ Supergroups\n"
-            "✅ Topic / Forum groups\n\n"
-            "🔹 *Moderation* – Warn, mute, ban\n"
-            "🔹 *Study Mode* – Auto-delete off-topic msgs\n"
-            "🔹 *Leaderboard* – Reward active learners\n"
-            "🔹 *Filters* – Auto-reply or delete keywords\n"
-            "🔹 *Reports* – Flag bad actors to admins\n\n"
-            "👇 Tap *Add to Any Group* to get started!"
+            "📚 *Welcome to StudyGuard Bot v4.0!*\n\n"
+            "✅ Normal groups\n✅ Supergroups\n✅ Topic / Forum groups\n\n"
+            "🔹 Moderation – Warn, mute, ban, unwarn\n"
+            "🔹 Study Mode – Auto-delete off-topic msgs\n"
+            "🔹 Leaderboard – Reward active learners\n"
+            "🔹 Filters – Text *and* sticker triggers\n"
+            "🔹 AFK System – Away status tracking\n"
+            "🔹 Rich Welcome – Photo/video + username/ID\n\n"
+            "👇 Tap *Add to Group* to get started!"
         )
         update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                   reply_markup=InlineKeyboardMarkup(keyboard))
+                                   reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
-        logger.error(f"/start error: {e}")
+        logger.error(f"start: {e}")
 
 def button_handler(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -245,51 +234,52 @@ def button_handler(update: Update, context: CallbackContext):
         query.answer()
     except Exception:
         pass
-
     try:
-        bot_username = context.bot.username
-        add_btn = InlineKeyboardButton(
-            "➕ Add to Any Group",
-            url=f"https://t.me/{bot_username}?startgroup=true&admin=delete_messages+restrict_members+ban_users"
-        )
-        back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_start")]])
+        bu = context.bot.username
+        add_btn = InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{bu}?startgroup=true&admin=delete_messages+restrict_members+ban_users")
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_start")]])
 
         if query.data == "show_commands":
             text = (
                 "📋 *All Commands*\n\n"
                 "*🛡️ Moderation (Admin)*\n"
-                "`/warn` – Warn user (reply to msg)\n"
+                "`/warn` – Warn user (reply)\n"
+                "`/unwarn` – Remove 1 warn (reply)\n"
                 "`/warns` – Check warn count\n"
-                "`/resetwarn` – Reset warns\n"
+                "`/resetwarn` – Reset all warns\n"
                 "`/mute [10m/1h/2d]` – Mute user\n"
                 "`/unmute` – Unmute user\n"
                 "`/ban` – Ban from group\n"
                 "`/unban @user` – Unban\n\n"
                 "*📚 Study Tools (Admin)*\n"
                 "`/study_mode on/off` – Toggle study mode\n"
-                "`/setwelcome [msg]` – Custom welcome\n"
-                "`/filter word [reply]` – Add filter\n"
+                "`/setwelcome [msg]` – Set welcome text\n"
+                "`/setwelcome off` – Disable welcome\n"
+                "`/filter word [reply]` – Add text filter\n"
+                "`/filtersticker word` – Add sticker filter (reply to sticker)\n"
                 "`/rmfilter word` – Remove filter\n"
                 "`/filters` – List all filters\n\n"
+                "*💤 AFK*\n"
+                "`/afk [reason]` – Go AFK\n\n"
                 "*📊 Everyone*\n"
                 "`/leaderboard` – Top learners\n"
-                "`/report` – Report user (reply to msg)\n"
+                "`/report` – Report user (reply)\n"
                 "`/stats` – Group statistics\n"
             )
-            query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_markup)
+            query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb)
 
         elif query.data == "show_about":
             text = (
-                "ℹ️ *About StudyGuard Bot v3.1*\n\n"
-                "🔸 Works in ALL Telegram group types\n"
-                "🔸 Topic/Forum group support built-in\n"
-                "🔸 Smart study mode filters casual chat\n"
-                "🔸 Point system rewards active learners\n"
-                "🔸 Full moderation suite for admins\n"
-                "🔸 Customizable filters & welcome messages\n\n"
+                "ℹ️ *StudyGuard Bot v4.0 – Rose Edition*\n\n"
+                "🔸 All group types supported\n"
+                "🔸 AFK system with auto-unafk\n"
+                "🔸 Sticker-based filters\n"
+                "🔸 Rich welcome: photo/video + user info\n"
+                "🔸 Unwarn support\n"
+                "🔸 Welcome on/off toggle\n\n"
                 "Made with ❤️ for learners everywhere"
             )
-            query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_markup)
+            query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb)
 
         elif query.data == "show_leaderboard":
             chat_id = str(update.effective_chat.id)
@@ -298,92 +288,176 @@ def button_handler(update: Update, context: CallbackContext):
             if not pts:
                 text = "📊 *Leaderboard*\n\nNo data yet! Start studying to earn points. 🎓"
             else:
-                sorted_users = sorted(pts.items(), key=lambda x: x[1], reverse=True)[:10]
-                medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
+                top = sorted(pts.items(), key=lambda x: x[1], reverse=True)[:10]
+                medals = ["🥇","🥈","🥉"] + ["🏅"]*7
                 lines = ["📊 *Top Learners*\n"]
-                for i, (u_id, p) in enumerate(sorted_users):
+                for i,(u_id,p) in enumerate(top):
                     name = data["user_names"].get(u_id, f"User{u_id[:4]}")
                     lines.append(f"{medals[i]} {name} — *{p} pts*")
                 text = "\n".join(lines)
-            query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_markup)
+            query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb)
 
         elif query.data == "back_start":
-            keyboard = [
-                [
-                    add_btn,
-                    InlineKeyboardButton("📖 Commands", callback_data="show_commands"),
-                ],
-                [
-                    InlineKeyboardButton("📊 Leaderboard", callback_data="show_leaderboard"),
-                    InlineKeyboardButton("ℹ️ About", callback_data="show_about"),
-                ],
+            kb = [
+                [add_btn, InlineKeyboardButton("📖 Commands", callback_data="show_commands")],
+                [InlineKeyboardButton("📊 Leaderboard", callback_data="show_leaderboard"),
+                 InlineKeyboardButton("ℹ️ About", callback_data="show_about")],
             ]
             text = (
-                "📚 *Welcome to StudyGuard Bot!*\n\n"
-                "I work in *all Telegram group types*:\n"
-                "✅ Normal groups\n"
-                "✅ Supergroups\n"
-                "✅ Topic / Forum groups\n\n"
-                "🔹 *Moderation* – Warn, mute, ban\n"
-                "🔹 *Study Mode* – Auto-delete off-topic msgs\n"
-                "🔹 *Leaderboard* – Reward active learners\n"
-                "🔹 *Filters* – Auto-reply or delete keywords\n"
-                "🔹 *Reports* – Flag bad actors to admins\n\n"
-                "👇 Tap *Add to Any Group* to get started!"
+                "📚 *Welcome to StudyGuard Bot v4.0!*\n\n"
+                "✅ Normal groups\n✅ Supergroups\n✅ Topic / Forum groups\n\n"
+                "🔹 Moderation – Warn, mute, ban, unwarn\n"
+                "🔹 Study Mode – Auto-delete off-topic msgs\n"
+                "🔹 Leaderboard – Reward active learners\n"
+                "🔹 Filters – Text *and* sticker triggers\n"
+                "🔹 AFK System – Away status tracking\n"
+                "🔹 Rich Welcome – Photo/video + username/ID\n\n"
+                "👇 Tap *Add to Group* to get started!"
             )
             query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
-                                     reply_markup=InlineKeyboardMarkup(keyboard))
+                                     reply_markup=InlineKeyboardMarkup(kb))
     except BadRequest as e:
-        # "Message is not modified" is harmless — ignore it
-        if "not modified" in str(e).lower():
-            pass
-        else:
+        if "not modified" not in str(e).lower():
             logger.warning(f"button_handler BadRequest: {e}")
     except Exception as e:
-        logger.error(f"button_handler error: {e}")
+        logger.error(f"button_handler: {e}")
 
 # ─────────────────────────────────────────────
-#  WELCOME
+#  WELCOME  (fixed + rich)
 # ─────────────────────────────────────────────
+def _build_welcome_text(template: str, member, chat) -> str:
+    """Replace placeholders with real user info."""
+    name      = member.first_name or "User"
+    username  = f"@{member.username}" if member.username else "No username"
+    user_id   = str(member.id)
+    group     = chat.title or "this group"
+    count     = ""
+    try:
+        count = str(chat.get_member_count())
+    except Exception:
+        pass
+
+    return (template
+            .replace("{name}",     f"[{name}](tg://user?id={member.id})")
+            .replace("{username}", username)
+            .replace("{id}",       user_id)
+            .replace("{group}",    group)
+            .replace("{count}",    count))
+
 def new_member(update: Update, context: CallbackContext):
     try:
         chat_id = cid(update)
+        chat    = update.effective_chat
+        thread_id = get_thread_id(update)
+
+        # Welcome disabled?
+        if data["welcome_off"].get(chat_id, False):
+            return
+
         for member in update.message.new_chat_members:
             if member.is_bot:
                 continue
+
             data["user_names"][str(member.id)] = member.first_name
-            welcome = data["welcome_msgs"].get(chat_id)
-            if welcome:
-                msg = welcome.replace("{name}", f"[{member.first_name}](tg://user?id={member.id})")
-            else:
-                msg = (
-                    f"👋 Welcome {user_mention(member)} to the study group!\n\n"
-                    "📌 Stay focused, be respectful, keep questions on-topic.\n"
-                    "Type /help to see available commands."
-                )
-            safe_reply(update, msg)
+            save_data()
+
+            wcfg = data["welcome_msgs"].get(chat_id, {})
+            template = wcfg.get("text") or (
+                "👋 Welcome {name}!\n\n"
+                "🆔 ID: `{id}`\n"
+                "👤 Username: {username}\n\n"
+                "📌 Stay focused and keep questions on-topic.\n"
+                "Type /help to see available commands."
+            )
+            text = _build_welcome_text(template, member, chat)
+
+            media_id   = wcfg.get("media")
+            media_type = wcfg.get("media_type")
+
+            send_kw = {"parse_mode": ParseMode.MARKDOWN}
+            if thread_id:
+                send_kw["message_thread_id"] = thread_id
+
+            try:
+                if media_id and media_type == "photo":
+                    context.bot.send_photo(chat_id=chat.id, photo=media_id,
+                                           caption=text, **send_kw)
+                elif media_id and media_type == "video":
+                    context.bot.send_video(chat_id=chat.id, video=media_id,
+                                           caption=text, **send_kw)
+                else:
+                    context.bot.send_message(chat_id=chat.id, text=text, **send_kw)
+            except Exception as e:
+                logger.warning(f"new_member send: {e}")
+
     except Exception as e:
-        logger.error(f"new_member error: {e}")
+        logger.error(f"new_member: {e}")
+
 
 def setwelcome(update: Update, context: CallbackContext):
+    """
+    /setwelcome off                      – disable welcome
+    /setwelcome <text>                   – set text welcome
+    /setwelcome <text> (reply to photo/video) – set media welcome
+    Placeholders: {name} {username} {id} {group} {count}
+    """
     try:
         if not admin_only(update, context): return
         chat_id = cid(update)
-        if not context.args:
+
+        full_text = " ".join(context.args) if context.args else ""
+
+        # /setwelcome off
+        if full_text.strip().lower() == "off":
+            data["welcome_off"][chat_id] = True
+            save_data()
+            safe_reply(update, "✅ Welcome message *disabled*. Use `/setwelcome <text>` to re-enable.")
+            return
+
+        # Re-enable if was off
+        data["welcome_off"][chat_id] = False
+
+        if not full_text:
             safe_reply(update,
-                "Usage: `/setwelcome Hello {name}, welcome!`\n"
-                "Use `{name}` as placeholder for new member's name."
+                "Usage:\n"
+                "`/setwelcome Hello {name}!` – text welcome\n"
+                "`/setwelcome off` – disable welcome\n\n"
+                "Placeholders: `{name}` `{username}` `{id}` `{group}` `{count}`\n"
+                "Reply to a photo/video while using this command to set media welcome."
             )
             return
-        welcome_text = " ".join(context.args)
-        data["welcome_msgs"][chat_id] = welcome_text
+
+        # Check for replied media
+        replied = update.message.reply_to_message
+        media_id   = None
+        media_type = None
+
+        if replied:
+            if replied.photo:
+                media_id   = replied.photo[-1].file_id
+                media_type = "photo"
+            elif replied.video:
+                media_id   = replied.video.file_id
+                media_type = "video"
+
+        ensure_chat(data["welcome_msgs"], chat_id)
+        data["welcome_msgs"][chat_id] = {
+            "text":       full_text,
+            "media":      media_id,
+            "media_type": media_type,
+        }
         save_data()
-        safe_reply(update, f"✅ Welcome message set!\n\n{welcome_text}")
+
+        mtype_str = f" + {media_type}" if media_type else ""
+        safe_reply(update,
+            f"✅ Welcome message set{mtype_str}!\n\n"
+            f"Preview text:\n{full_text}"
+        )
     except Exception as e:
-        logger.error(f"setwelcome error: {e}")
+        logger.error(f"setwelcome: {e}")
 
 # ─────────────────────────────────────────────
-#  WARN
+#  WARN / UNWARN
 # ─────────────────────────────────────────────
 def warn(update: Update, context: CallbackContext):
     try:
@@ -400,25 +474,49 @@ def warn(update: Update, context: CallbackContext):
         ensure_chat(data["warns"], chat_id)
         t_id = str(target.id)
         data["warns"][chat_id][t_id] = data["warns"][chat_id].get(t_id, 0) + 1
-        warn_count = data["warns"][chat_id][t_id]
+        wc = data["warns"][chat_id][t_id]
         save_data()
 
-        if warn_count >= 3:
+        if wc >= 3:
             try:
                 context.bot.ban_chat_member(update.effective_chat.id, target.id)
             except TelegramError as e:
-                logger.warning(f"ban failed: {e}")
+                logger.warning(f"ban: {e}")
             data["warns"][chat_id][t_id] = 0
             save_data()
-            safe_reply(update, f"🔨 {user_mention(target)} has been *banned* after 3 warnings!")
+            safe_reply(update, f"🔨 {user_mention(target)} *banned* after 3 warnings!")
         else:
             safe_reply(update,
-                f"⚠️ {user_mention(target)} has been warned!\n"
-                f"Warnings: *{warn_count}/3*\n"
-                f"_{3 - warn_count} more = auto ban._"
+                f"⚠️ {user_mention(target)} warned!\n"
+                f"Warnings: *{wc}/3*\n"
+                f"_{3-wc} more = auto ban._"
             )
     except Exception as e:
-        logger.error(f"warn error: {e}")
+        logger.error(f"warn: {e}")
+
+def unwarn(update: Update, context: CallbackContext):
+    """Remove one warning from a user."""
+    try:
+        if not admin_only(update, context): return
+        chat_id = cid(update)
+        target = update.message.reply_to_message.from_user if update.message.reply_to_message else None
+        if not target:
+            safe_reply(update, "↩️ Reply to the user's message to remove a warn.")
+            return
+        ensure_chat(data["warns"], chat_id)
+        t_id = str(target.id)
+        current = data["warns"][chat_id].get(t_id, 0)
+        if current <= 0:
+            safe_reply(update, f"✅ {user_mention(target)} has no warnings to remove.")
+            return
+        data["warns"][chat_id][t_id] = current - 1
+        save_data()
+        safe_reply(update,
+            f"✅ Removed 1 warning from {user_mention(target)}.\n"
+            f"Warnings now: *{current-1}/3*"
+        )
+    except Exception as e:
+        logger.error(f"unwarn: {e}")
 
 def warns(update: Update, context: CallbackContext):
     try:
@@ -429,7 +527,7 @@ def warns(update: Update, context: CallbackContext):
         count = data["warns"][chat_id].get(t_id, 0)
         safe_reply(update, f"📋 {user_mention(target)} has *{count}/3* warnings.")
     except Exception as e:
-        logger.error(f"warns error: {e}")
+        logger.error(f"warns: {e}")
 
 def resetwarn(update: Update, context: CallbackContext):
     try:
@@ -437,24 +535,23 @@ def resetwarn(update: Update, context: CallbackContext):
         chat_id = cid(update)
         target = update.message.reply_to_message.from_user if update.message.reply_to_message else None
         if not target:
-            safe_reply(update, "↩️ Reply to the user's message to reset their warns.")
+            safe_reply(update, "↩️ Reply to the user's message.")
             return
         ensure_chat(data["warns"], chat_id)
         data["warns"][chat_id][str(target.id)] = 0
         save_data()
-        safe_reply(update, f"✅ Warnings reset for {user_mention(target)}.")
+        safe_reply(update, f"✅ All warnings reset for {user_mention(target)}.")
     except Exception as e:
-        logger.error(f"resetwarn error: {e}")
+        logger.error(f"resetwarn: {e}")
 
 # ─────────────────────────────────────────────
 #  MUTE / UNMUTE
 # ─────────────────────────────────────────────
 def parse_duration(text: str):
-    match = re.match(r"^(\d+)(m|h|d)$", text.lower())
-    if not match:
-        return None
-    val, unit = int(match.group(1)), match.group(2)
-    return val * {"m": 60, "h": 3600, "d": 86400}[unit]
+    m = re.match(r"^(\d+)(m|h|d)$", text.lower())
+    if not m: return None
+    val, unit = int(m.group(1)), m.group(2)
+    return val * {"m":60,"h":3600,"d":86400}[unit]
 
 def mute(update: Update, context: CallbackContext):
     try:
@@ -466,26 +563,22 @@ def mute(update: Update, context: CallbackContext):
         if is_admin(update, context, target.id):
             safe_reply(update, "🚫 Cannot mute an admin.")
             return
-
         duration_sec = None
-        duration_str = "indefinitely"
+        dur_str = "indefinitely"
         if context.args:
             duration_sec = parse_duration(context.args[0])
             if duration_sec:
-                duration_str = f"for {context.args[0]}"
-
+                dur_str = f"for {context.args[0]}"
         until = (datetime.now() + timedelta(seconds=duration_sec)) if duration_sec else None
         perms = ChatPermissions(can_send_messages=False)
         try:
-            context.bot.restrict_chat_member(
-                update.effective_chat.id, target.id, perms, until_date=until
-            )
+            context.bot.restrict_chat_member(update.effective_chat.id, target.id, perms, until_date=until)
         except TelegramError as e:
             safe_reply(update, f"❌ Could not mute: {e}")
             return
-        safe_reply(update, f"🔇 {user_mention(target)} muted *{duration_str}*.")
+        safe_reply(update, f"🔇 {user_mention(target)} muted *{dur_str}*.")
     except Exception as e:
-        logger.error(f"mute error: {e}")
+        logger.error(f"mute: {e}")
 
 def unmute(update: Update, context: CallbackContext):
     try:
@@ -495,10 +588,8 @@ def unmute(update: Update, context: CallbackContext):
             safe_reply(update, "↩️ Reply to the user's message to unmute them.")
             return
         perms = ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
+            can_send_messages=True, can_send_media_messages=True,
+            can_send_polls=True, can_send_other_messages=True,
             can_add_web_page_previews=True
         )
         try:
@@ -506,9 +597,9 @@ def unmute(update: Update, context: CallbackContext):
         except TelegramError as e:
             safe_reply(update, f"❌ Could not unmute: {e}")
             return
-        safe_reply(update, f"🔊 {user_mention(target)} has been unmuted.")
+        safe_reply(update, f"🔊 {user_mention(target)} unmuted.")
     except Exception as e:
-        logger.error(f"unmute error: {e}")
+        logger.error(f"unmute: {e}")
 
 # ─────────────────────────────────────────────
 #  BAN / UNBAN
@@ -528,9 +619,9 @@ def ban(update: Update, context: CallbackContext):
         except TelegramError as e:
             safe_reply(update, f"❌ Could not ban: {e}")
             return
-        safe_reply(update, f"🔨 {user_mention(target)} has been *banned*.")
+        safe_reply(update, f"🔨 {user_mention(target)} *banned*.")
     except Exception as e:
-        logger.error(f"ban error: {e}")
+        logger.error(f"ban: {e}")
 
 def unban(update: Update, context: CallbackContext):
     try:
@@ -542,11 +633,11 @@ def unban(update: Update, context: CallbackContext):
         try:
             user = context.bot.get_chat(f"@{username}")
             context.bot.unban_chat_member(update.effective_chat.id, user.id)
-            safe_reply(update, f"✅ @{username} has been unbanned.")
+            safe_reply(update, f"✅ @{username} unbanned.")
         except TelegramError as e:
             safe_reply(update, f"❌ Failed: {e}")
     except Exception as e:
-        logger.error(f"unban error: {e}")
+        logger.error(f"unban: {e}")
 
 # ─────────────────────────────────────────────
 #  STUDY MODE
@@ -555,51 +646,79 @@ def study_mode(update: Update, context: CallbackContext):
     try:
         if not admin_only(update, context): return
         chat_id = cid(update)
-        if not context.args or context.args[0].lower() not in ("on", "off"):
-            current = data["study_mode"].get(chat_id, False)
-            status = "🟢 ON" if current else "🔴 OFF"
-            safe_reply(update,
-                f"📚 Study Mode is currently *{status}*\n\n"
-                "Usage: `/study_mode on` or `/study_mode off`"
-            )
+        if not context.args or context.args[0].lower() not in ("on","off"):
+            status = "🟢 ON" if data["study_mode"].get(chat_id, False) else "🔴 OFF"
+            safe_reply(update, f"📚 Study Mode: *{status}*\nUsage: `/study_mode on` or `/study_mode off`")
             return
         enable = context.args[0].lower() == "on"
         data["study_mode"][chat_id] = enable
         save_data()
         if enable:
-            safe_reply(update,
-                "📚 *Study Mode ENABLED!*\n\n"
-                "Off-topic messages (hi, lol, ok, bye) will be auto-deleted.\n"
-                "Keep it focused! 🎯"
-            )
+            safe_reply(update, "📚 *Study Mode ENABLED!*\n\nOff-topic messages will be auto-deleted. 🎯")
         else:
-            safe_reply(update, "📖 *Study Mode DISABLED.*\n\nAll messages now allowed.")
+            safe_reply(update, "📖 *Study Mode DISABLED.*")
     except Exception as e:
-        logger.error(f"study_mode error: {e}")
+        logger.error(f"study_mode: {e}")
 
 # ─────────────────────────────────────────────
-#  FILTERS
+#  FILTERS  (text + sticker)
 # ─────────────────────────────────────────────
 def add_filter(update: Update, context: CallbackContext):
+    """
+    /filter word [reply text]   – text filter
+    """
     try:
         if not admin_only(update, context): return
         chat_id = cid(update)
         if not context.args:
             safe_reply(update,
                 "Usage:\n"
-                "`/filter spam` – auto-delete messages with 'spam'\n"
-                "`/filter doubt Check pinned notes!` – auto-reply"
+                "`/filter spam` – auto-delete msgs with 'spam'\n"
+                "`/filter doubt Check the pinned post!` – auto-reply\n"
+                "`/filtersticker triggerword` – reply to a sticker to set sticker filter"
             )
             return
         ensure_chat(data["filters"], chat_id)
-        keyword = context.args[0].lower()
+        keyword  = context.args[0].lower()
         response = " ".join(context.args[1:]) if len(context.args) > 1 else None
-        data["filters"][chat_id][keyword] = response
+        data["filters"][chat_id][keyword] = {
+            "response":   response,
+            "is_sticker": False,
+            "sticker_id": None,
+        }
         save_data()
         action = f'reply: "{response}"' if response else "delete the message"
         safe_reply(update, f"✅ Filter set!\n`{keyword}` → {action}")
     except Exception as e:
-        logger.error(f"add_filter error: {e}")
+        logger.error(f"add_filter: {e}")
+
+def filter_sticker(update: Update, context: CallbackContext):
+    """
+    Reply to a sticker + /filtersticker triggerword
+    Bot will send that sticker whenever triggerword appears.
+    """
+    try:
+        if not admin_only(update, context): return
+        chat_id = cid(update)
+        if not context.args:
+            safe_reply(update, "Usage: Reply to a sticker with `/filtersticker triggerword`")
+            return
+        replied = update.message.reply_to_message
+        if not replied or not replied.sticker:
+            safe_reply(update, "↩️ Reply to a sticker with this command.")
+            return
+        keyword    = context.args[0].lower()
+        sticker_id = replied.sticker.file_id
+        ensure_chat(data["filters"], chat_id)
+        data["filters"][chat_id][keyword] = {
+            "response":   None,
+            "is_sticker": True,
+            "sticker_id": sticker_id,
+        }
+        save_data()
+        safe_reply(update, f"✅ Sticker filter set!\n`{keyword}` → 🎭 sticker reply")
+    except Exception as e:
+        logger.error(f"filter_sticker: {e}")
 
 def rm_filter(update: Update, context: CallbackContext):
     try:
@@ -615,25 +734,67 @@ def rm_filter(update: Update, context: CallbackContext):
             save_data()
             safe_reply(update, f"✅ Filter `{keyword}` removed.")
         else:
-            safe_reply(update, f"❌ No filter found for `{keyword}`.")
+            safe_reply(update, f"❌ No filter for `{keyword}`.")
     except Exception as e:
-        logger.error(f"rm_filter error: {e}")
+        logger.error(f"rm_filter: {e}")
 
 def list_filters(update: Update, context: CallbackContext):
     try:
         chat_id = cid(update)
         ensure_chat(data["filters"], chat_id)
-        filters_dict = data["filters"][chat_id]
-        if not filters_dict:
-            safe_reply(update, "No filters set for this group yet.")
+        fd = data["filters"][chat_id]
+        if not fd:
+            safe_reply(update, "No filters set yet.")
             return
         lines = ["🔍 *Active Filters:*\n"]
-        for kw, resp in filters_dict.items():
-            action = f'→ "{resp}"' if resp else "→ delete"
-            lines.append(f"• `{kw}` {action}")
+        for kw, cfg in fd.items():
+            if cfg.get("is_sticker"):
+                lines.append(f"• `{kw}` → 🎭 sticker")
+            elif cfg.get("response"):
+                lines.append(f"• `{kw}` → \"{cfg['response']}\"")
+            else:
+                lines.append(f"• `{kw}` → delete")
         safe_reply(update, "\n".join(lines))
     except Exception as e:
-        logger.error(f"list_filters error: {e}")
+        logger.error(f"list_filters: {e}")
+
+# ─────────────────────────────────────────────
+#  AFK SYSTEM
+# ─────────────────────────────────────────────
+def afk_cmd(update: Update, context: CallbackContext):
+    """
+    /afk [reason]
+    """
+    try:
+        user = update.effective_user
+        u_id = str(user.id)
+        reason = " ".join(context.args) if context.args else "AFK"
+        data["afk"][u_id] = {
+            "reason": reason,
+            "time":   datetime.now().strftime("%H:%M"),
+        }
+        save_data()
+        safe_reply(update,
+            f"💤 {user_mention(user)} is now *AFK*\n"
+            f"Reason: _{reason}_"
+        )
+    except Exception as e:
+        logger.error(f"afk_cmd: {e}")
+
+def _unafk(user, update: Update, context: CallbackContext):
+    u_id = str(user.id)
+    if u_id not in data["afk"]:
+        return
+    afk_info = data["afk"].pop(u_id)
+    save_data()
+    try:
+        safe_reply(update,
+            f"👋 Welcome back {user_mention(user)}!\n"
+            f"You were AFK since *{afk_info.get('time','?')}*\n"
+            f"Reason was: _{afk_info.get('reason','AFK')}_"
+        )
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 #  LEADERBOARD
@@ -644,17 +805,17 @@ def leaderboard(update: Update, context: CallbackContext):
         ensure_chat(data["points"], chat_id)
         pts = data["points"][chat_id]
         if not pts:
-            safe_reply(update, "📊 No leaderboard data yet!\n\nSend study messages to earn points. 🎓")
+            safe_reply(update, "📊 No data yet! Send study messages to earn points. 🎓")
             return
-        sorted_users = sorted(pts.items(), key=lambda x: x[1], reverse=True)[:10]
-        medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
+        top = sorted(pts.items(), key=lambda x: x[1], reverse=True)[:10]
+        medals = ["🥇","🥈","🥉"] + ["🏅"]*7
         lines = ["📊 *Top Learners Leaderboard*\n"]
-        for i, (u_id, p) in enumerate(sorted_users):
+        for i,(u_id,p) in enumerate(top):
             name = data["user_names"].get(u_id, f"User{u_id[:4]}")
             lines.append(f"{medals[i]} *{i+1}.* {name} — `{p} pts`")
         safe_reply(update, "\n".join(lines))
     except Exception as e:
-        logger.error(f"leaderboard error: {e}")
+        logger.error(f"leaderboard: {e}")
 
 # ─────────────────────────────────────────────
 #  REPORT
@@ -664,7 +825,7 @@ def report(update: Update, context: CallbackContext):
         reporter = update.effective_user
         target = update.message.reply_to_message.from_user if update.message.reply_to_message else None
         if not target:
-            safe_reply(update, "↩️ Reply to a message to report that user to admins.")
+            safe_reply(update, "↩️ Reply to a message to report that user.")
             return
         if target.id == reporter.id:
             safe_reply(update, "😅 You can't report yourself!")
@@ -672,11 +833,9 @@ def report(update: Update, context: CallbackContext):
         try:
             admins = update.effective_chat.get_administrators()
         except TelegramError as e:
-            logger.warning(f"get_administrators failed: {e}")
             safe_reply(update, "❌ Could not fetch admin list.")
             return
-
-        report_msg = (
+        msg = (
             f"🚨 *Report Alert!*\n\n"
             f"👤 Reporter: {user_mention(reporter)}\n"
             f"🎯 Reported: {user_mention(target)}\n"
@@ -687,13 +846,13 @@ def report(update: Update, context: CallbackContext):
         for admin in admins:
             if not admin.user.is_bot:
                 try:
-                    context.bot.send_message(admin.user.id, report_msg, parse_mode=ParseMode.MARKDOWN)
+                    context.bot.send_message(admin.user.id, msg, parse_mode=ParseMode.MARKDOWN)
                     notified += 1
                 except Exception:
                     pass
         safe_reply(update, f"✅ Report sent to *{notified}* admin(s). Thank you!")
     except Exception as e:
-        logger.error(f"report error: {e}")
+        logger.error(f"report: {e}")
 
 # ─────────────────────────────────────────────
 #  STATS
@@ -701,28 +860,32 @@ def report(update: Update, context: CallbackContext):
 def stats(update: Update, context: CallbackContext):
     try:
         chat_id = cid(update)
-        chat = update.effective_chat
-        ensure_chat(data["points"], chat_id)
-        ensure_chat(data["warns"], chat_id)
+        chat    = update.effective_chat
+        ensure_chat(data["points"],  chat_id)
+        ensure_chat(data["warns"],   chat_id)
         ensure_chat(data["filters"], chat_id)
 
         total_users   = len(data["points"][chat_id])
         total_warns   = sum(data["warns"][chat_id].values())
         total_filters = len(data["filters"][chat_id])
+        afk_count     = len(data["afk"])
         study         = "🟢 ON"  if data["study_mode"].get(chat_id, False) else "🔴 OFF"
-        is_forum      = "✅ Yes" if getattr(chat, "is_forum", False)        else "❌ No"
+        welcome       = "🔴 OFF" if data["welcome_off"].get(chat_id, False) else "🟢 ON"
+        is_forum      = "✅ Yes" if getattr(chat, "is_forum", False)         else "❌ No"
 
         safe_reply(update,
             f"📈 *Group Statistics*\n\n"
             f"👥 Active learners: *{total_users}*\n"
             f"⚠️ Total warnings: *{total_warns}*\n"
             f"🔍 Active filters: *{total_filters}*\n"
+            f"💤 AFK users: *{afk_count}*\n"
             f"📚 Study Mode: *{study}*\n"
+            f"👋 Welcome: *{welcome}*\n"
             f"🗂 Topic group: *{is_forum}*\n"
             f"📌 Group: *{chat.title}*"
         )
     except Exception as e:
-        logger.error(f"stats error: {e}")
+        logger.error(f"stats: {e}")
 
 # ─────────────────────────────────────────────
 #  HELP
@@ -730,90 +893,174 @@ def stats(update: Update, context: CallbackContext):
 def help_cmd(update: Update, context: CallbackContext):
     try:
         text = (
-            "📋 *StudyGuard Bot Commands*\n\n"
+            "📋 *StudyGuard Bot v4.0 Commands*\n\n"
             "*🛡️ Moderation (Admins Only)*\n"
-            "`/warn` – Warn user _(reply to msg)_\n"
+            "`/warn` – Warn user _(reply)_\n"
+            "`/unwarn` – Remove 1 warn _(reply)_\n"
             "`/warns` – Check warn count\n"
-            "`/resetwarn` – Reset warns\n"
+            "`/resetwarn` – Reset all warns\n"
             "`/mute [10m/1h/2d]` – Mute user\n"
             "`/unmute` – Unmute user\n"
             "`/ban` – Ban from group\n"
             "`/unban @user` – Unban\n\n"
             "*📚 Study Tools (Admins)*\n"
             "`/study_mode on|off` – Toggle study mode\n"
-            "`/setwelcome [msg]` – Set welcome message\n"
-            "`/filter word [reply]` – Add filter\n"
+            "`/setwelcome <msg>` – Set welcome\n"
+            "`/setwelcome off` – Disable welcome\n"
+            "_Placeholders: {name} {username} {id} {group} {count}_\n"
+            "_Reply to photo/video to attach media_\n\n"
+            "`/filter word [reply]` – Add text filter\n"
+            "`/filtersticker word` – Add sticker filter _(reply to sticker)_\n"
             "`/rmfilter word` – Remove filter\n"
             "`/filters` – List all filters\n\n"
+            "*💤 AFK*\n"
+            "`/afk [reason]` – Go AFK\n\n"
             "*📊 Everyone*\n"
             "`/leaderboard` – Top learners\n"
-            "`/report` – Report user _(reply to msg)_\n"
-            "`/stats` – Group stats\n"
+            "`/report` – Report user _(reply)_\n"
+            "`/stats` – Group statistics\n"
             "`/start` – Main menu\n"
         )
         safe_reply(update, text)
     except Exception as e:
-        logger.error(f"help_cmd error: {e}")
+        logger.error(f"help_cmd: {e}")
 
 # ─────────────────────────────────────────────
-#  MESSAGE HANDLER
+#  MESSAGE HANDLER (text + sticker)
 # ─────────────────────────────────────────────
 def handle_message(update: Update, context: CallbackContext):
     try:
-        if not update.message or not update.message.text:
+        msg  = update.message
+        if not msg:
             return
         chat_id = cid(update)
-        user = update.effective_user
+        user    = update.effective_user
         if not user:
             return
 
-        text = update.message.text
         u_id = str(user.id)
         data["user_names"][u_id] = user.first_name
+
+        # ── AFK: sender just sent a message → unafk ──
+        if u_id in data["afk"]:
+            _unafk(user, update, context)
+
+        # ── AFK: someone mentioned an AFK user ──
+        if msg.text and msg.entities:
+            for entity in msg.entities:
+                if entity.type in ("mention", "text_mention"):
+                    if entity.type == "text_mention" and entity.user:
+                        m_uid = str(entity.user.id)
+                    else:
+                        # @username mention — skip (can't resolve without API call risk)
+                        continue
+                    if m_uid in data["afk"]:
+                        afk_info = data["afk"][m_uid]
+                        name = data["user_names"].get(m_uid, "That user")
+                        safe_reply(update,
+                            f"💤 *{name}* is AFK since {afk_info.get('time','?')}\n"
+                            f"Reason: _{afk_info.get('reason','AFK')}_"
+                        )
+
+        text       = msg.text or ""
         text_lower = text.lower()
 
-        # ── Filters ──
+        # ── Filters (text) ──
         ensure_chat(data["filters"], chat_id)
-        for keyword, response in data["filters"][chat_id].items():
+        for keyword, cfg in data["filters"][chat_id].items():
             if keyword in text_lower:
-                if response:
-                    safe_reply(update, response)
+                if cfg.get("is_sticker") and cfg.get("sticker_id"):
+                    thread_id = get_thread_id(update)
+                    kw = {}
+                    if thread_id:
+                        kw["message_thread_id"] = thread_id
+                    try:
+                        context.bot.send_sticker(
+                            chat_id=update.effective_chat.id,
+                            sticker=cfg["sticker_id"],
+                            **kw
+                        )
+                    except Exception as e:
+                        logger.warning(f"sticker filter send: {e}")
+                elif cfg.get("response"):
+                    safe_reply(update, cfg["response"])
                 else:
-                    safe_delete(update.message)
+                    safe_delete(msg)
                 return
 
         # ── Study mode ──
-        if data["study_mode"].get(chat_id, False):
+        if data["study_mode"].get(chat_id, False) and text:
             if not is_admin(update, context) and is_non_study_msg(text):
-                safe_delete(update.message)
-                chat = update.effective_chat
-                is_forum = getattr(chat, "is_forum", False)
-                thread_id = getattr(update.message, "message_thread_id", None) if is_forum else None
-
+                safe_delete(msg)
+                chat      = update.effective_chat
+                thread_id = get_thread_id(update)
                 notice = safe_send(
                     context,
-                    chat_id=update.effective_chat.id,
+                    chat_id=chat.id,
                     text=f"📚 {user_mention(user)} — *Study mode ON!* Keep it study-related. 🎯",
                     thread_id=thread_id
                 )
                 if notice:
                     try:
                         context.job_queue.run_once(
-                            lambda ctx: ctx.bot.delete_message(update.effective_chat.id, notice.message_id),
+                            lambda ctx: ctx.bot.delete_message(chat.id, notice.message_id),
                             5
                         )
                     except Exception as e:
-                        logger.warning(f"job_queue schedule failed: {e}")
+                        logger.warning(f"job_queue: {e}")
                 return
 
         # ── Award points ──
-        if any(kw in text_lower for kw in STUDY_KEYWORDS) or len(text.split()) >= 5:
+        if text and (any(kw in text_lower for kw in STUDY_KEYWORDS) or len(text.split()) >= 5):
             ensure_chat(data["points"], chat_id)
             add_points(chat_id, u_id, 1)
             save_data()
 
     except Exception as e:
-        logger.error(f"handle_message error: {e}")
+        logger.error(f"handle_message: {e}")
+
+# ─────────────────────────────────────────────
+#  STICKER HANDLER
+# ─────────────────────────────────────────────
+def handle_sticker(update: Update, context: CallbackContext):
+    """Delete stickers in study mode (admins exempt)."""
+    try:
+        msg = update.message
+        if not msg:
+            return
+        chat_id = cid(update)
+        user    = update.effective_user
+        if not user:
+            return
+
+        u_id = str(user.id)
+        data["user_names"][u_id] = user.first_name
+
+        # AFK: sending anything counts as coming back
+        if u_id in data["afk"]:
+            _unafk(user, update, context)
+
+        if data["study_mode"].get(chat_id, False):
+            if not is_admin(update, context):
+                safe_delete(msg)
+                chat      = update.effective_chat
+                thread_id = get_thread_id(update)
+                notice = safe_send(
+                    context,
+                    chat_id=chat.id,
+                    text=f"📚 {user_mention(user)} — *Study mode ON!* No stickers allowed. 🎯",
+                    thread_id=thread_id
+                )
+                if notice:
+                    try:
+                        context.job_queue.run_once(
+                            lambda ctx: ctx.bot.delete_message(chat.id, notice.message_id),
+                            5
+                        )
+                    except Exception as e:
+                        logger.warning(f"job_queue sticker notice: {e}")
+    except Exception as e:
+        logger.error(f"handle_sticker: {e}")
 
 # ─────────────────────────────────────────────
 #  MAIN
@@ -828,40 +1075,39 @@ def main():
     updater = Updater(
         token,
         use_context=True,
-        # Increase timeouts to survive slow connections
-        request_kwargs={
-            "read_timeout": 30,
-            "connect_timeout": 30,
-        }
+        request_kwargs={"read_timeout": 30, "connect_timeout": 30}
     )
     dp = updater.dispatcher
 
-    dp.add_handler(CommandHandler("start",       start))
-    dp.add_handler(CommandHandler("help",        help_cmd))
-    dp.add_handler(CommandHandler("warn",        warn))
-    dp.add_handler(CommandHandler("warns",       warns))
-    dp.add_handler(CommandHandler("resetwarn",   resetwarn))
-    dp.add_handler(CommandHandler("mute",        mute))
-    dp.add_handler(CommandHandler("unmute",      unmute))
-    dp.add_handler(CommandHandler("ban",         ban))
-    dp.add_handler(CommandHandler("unban",       unban))
-    dp.add_handler(CommandHandler("study_mode",  study_mode))
-    dp.add_handler(CommandHandler("setwelcome",  setwelcome))
-    dp.add_handler(CommandHandler("filter",      add_filter))
-    dp.add_handler(CommandHandler("rmfilter",    rm_filter))
-    dp.add_handler(CommandHandler("filters",     list_filters))
-    dp.add_handler(CommandHandler("leaderboard", leaderboard))
-    dp.add_handler(CommandHandler("report",      report))
-    dp.add_handler(CommandHandler("stats",       stats))
+    dp.add_handler(CommandHandler("start",          start))
+    dp.add_handler(CommandHandler("help",           help_cmd))
+    dp.add_handler(CommandHandler("warn",           warn))
+    dp.add_handler(CommandHandler("unwarn",         unwarn))
+    dp.add_handler(CommandHandler("warns",          warns))
+    dp.add_handler(CommandHandler("resetwarn",      resetwarn))
+    dp.add_handler(CommandHandler("mute",           mute))
+    dp.add_handler(CommandHandler("unmute",         unmute))
+    dp.add_handler(CommandHandler("ban",            ban))
+    dp.add_handler(CommandHandler("unban",          unban))
+    dp.add_handler(CommandHandler("study_mode",     study_mode))
+    dp.add_handler(CommandHandler("setwelcome",     setwelcome))
+    dp.add_handler(CommandHandler("filter",         add_filter))
+    dp.add_handler(CommandHandler("filtersticker",  filter_sticker))
+    dp.add_handler(CommandHandler("rmfilter",       rm_filter))
+    dp.add_handler(CommandHandler("filters",        list_filters))
+    dp.add_handler(CommandHandler("leaderboard",    leaderboard))
+    dp.add_handler(CommandHandler("report",         report))
+    dp.add_handler(CommandHandler("stats",          stats))
+    dp.add_handler(CommandHandler("afk",            afk_cmd))
 
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, new_member))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    dp.add_handler(MessageHandler(Filters.sticker, handle_sticker))
 
-    # Global error handler — prevents crashes from unhandled exceptions
     dp.add_error_handler(error_handler)
 
-    print("🚀 StudyGuard Bot v3.1 is running!")
+    print("🚀 StudyGuard Bot v4.0 (Rose Edition) is running!")
     updater.start_polling(
         drop_pending_updates=True,
         timeout=30,
