@@ -262,6 +262,8 @@ def button_handler(update: Update, context: CallbackContext):
                 "`/filters` – List all filters\n\n"
                 "*💤 AFK*\n"
                 "`/afk [reason]` – Go AFK\n\n"
+            "*🗑 Purge (Admin)*\n"
+            "`/purge` – Delete messages from replied msg to latest _(reply to msg)_\n\n"
                 "*📊 Everyone*\n"
                 "`/leaderboard` – Top learners\n"
                 "`/report` – Report user (reply)\n"
@@ -987,6 +989,8 @@ def help_cmd(update: Update, context: CallbackContext):
             "`/filters` – List all filters\n\n"
             "*💤 AFK*\n"
             "`/afk [reason]` – Go AFK\n\n"
+            "*🗑 Purge (Admin)*\n"
+            "`/purge` – Delete messages from replied msg to latest _(reply to msg)_\n\n"
             "*📊 Everyone*\n"
             "`/leaderboard` – Top learners\n"
             "`/report` – Report user _(reply)_\n"
@@ -996,6 +1000,73 @@ def help_cmd(update: Update, context: CallbackContext):
         safe_reply(update, text)
     except Exception as e:
         logger.error(f"help_cmd: {e}")
+
+# ─────────────────────────────────────────────
+#  PURGE
+# ─────────────────────────────────────────────
+def purge(update: Update, context: CallbackContext):
+    """
+    /purge — reply to a message, deletes from that msg to latest in this section.
+    Works in normal groups, supergroups, and topic/forum sections.
+    Admin only.
+    """
+    try:
+        if not admin_only(update, context): return
+
+        replied = update.message.reply_to_message
+        if not replied:
+            safe_reply(update, "↩️ Reply to the message you want to start purging from.", context=context)
+            return
+
+        chat      = update.effective_chat
+        thread_id = get_thread_id(update)
+        from_id   = replied.message_id
+        to_id     = update.message.message_id  # the /purge command msg itself
+
+        deleted  = 0
+        failed   = 0
+
+        # Delete from replied msg up to (and including) the /purge command
+        for msg_id in range(from_id, to_id + 1):
+            try:
+                context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
+                deleted += 1
+            except BadRequest:
+                # Message doesn't exist or already deleted — skip silently
+                failed += 1
+            except TelegramError as e:
+                logger.warning(f"purge delete {msg_id}: {e}")
+                failed += 1
+            except Exception as e:
+                logger.warning(f"purge unexpected {msg_id}: {e}")
+                failed += 1
+
+        # Send confirmation then auto-delete it after 5s
+        send_kw = {"parse_mode": ParseMode.MARKDOWN}
+        if thread_id:
+            send_kw["message_thread_id"] = thread_id
+
+        notice = None
+        try:
+            notice = context.bot.send_message(
+                chat_id=chat.id,
+                text=f"🗑 Purged *{deleted}* message(s).",
+                **send_kw
+            )
+        except Exception as e:
+            logger.warning(f"purge notice send: {e}")
+
+        if notice:
+            try:
+                context.job_queue.run_once(
+                    lambda ctx: ctx.bot.delete_message(chat.id, notice.message_id),
+                    5
+                )
+            except Exception as e:
+                logger.warning(f"purge job_queue: {e}")
+
+    except Exception as e:
+        logger.error(f"purge: {e}")
 
 # ─────────────────────────────────────────────
 #  MESSAGE HANDLER (text + sticker)
@@ -1171,6 +1242,7 @@ def main():
     dp.add_handler(CommandHandler("report",         report))
     dp.add_handler(CommandHandler("stats",          stats))
     dp.add_handler(CommandHandler("afk",            afk_cmd))
+    dp.add_handler(CommandHandler("purge",           purge))
 
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, new_member))
