@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ChatPermissions, ParseMode
+    ChatPermissions, ParseMode, ChatMemberUpdated
 )
 from telegram.error import (
     TelegramError, Unauthorized, BadRequest,
@@ -23,7 +23,7 @@ from telegram.error import (
 )
 from telegram.ext import (
     Updater, CommandHandler, MessageHandler, CallbackQueryHandler,
-    Filters, CallbackContext
+    ChatMemberHandler, Filters, CallbackContext
 )
 
 logging.basicConfig(
@@ -346,6 +346,60 @@ def _build_welcome_text(template: str, member, chat) -> str:
     result = result.replace("{group}",     group)
     result = result.replace("{count}",     count)
     return result
+
+def greet_new_member(update: Update, context: CallbackContext):
+    """
+    Handles chat_member updates — fires when someone joins a supergroup/topic group.
+    Calls the same welcome logic as new_member.
+    """
+    try:
+        result = update.chat_member
+        if not result:
+            return
+        old_status = result.old_chat_member.status
+        new_status = result.new_chat_member.status
+        # Only fire when someone actually joins (was not member, now is member)
+        if old_status in ("left", "kicked", "restricted") and new_status == "member":
+            member = result.new_chat_member.user
+            if member.is_bot:
+                return
+            chat    = update.effective_chat
+            chat_id = str(chat.id)
+
+            if data["welcome_off"].get(chat_id, False):
+                return
+
+            data["user_names"][str(member.id)] = member.first_name
+            save_data()
+
+            wcfg     = data["welcome_msgs"].get(chat_id, {})
+            template = wcfg.get("text") or (
+                "👋 Welcome {name}!\n\n"
+                "🆔 ID: `{id}`\n"
+                "👤 Username: {username}\n\n"
+                "📌 Stay focused and keep questions on-topic.\n"
+                "Type /help to see available commands."
+            )
+            text       = _build_welcome_text(template, member, chat)
+            media_id   = wcfg.get("media")
+            media_type = wcfg.get("media_type")
+
+            send_kw = {"parse_mode": ParseMode.MARKDOWN}
+
+            try:
+                if media_id and media_type == "photo":
+                    context.bot.send_photo(chat_id=chat.id, photo=media_id,
+                                           caption=text, **send_kw)
+                elif media_id and media_type == "video":
+                    context.bot.send_video(chat_id=chat.id, video=media_id,
+                                           caption=text, **send_kw)
+                else:
+                    context.bot.send_message(chat_id=chat.id, text=text, **send_kw)
+            except Exception as e:
+                logger.warning(f"greet_new_member send: {e}")
+    except Exception as e:
+        logger.error(f"greet_new_member: {e}")
+
 
 def new_member(update: Update, context: CallbackContext):
     try:
@@ -1105,6 +1159,7 @@ def main():
 
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, new_member))
+    dp.add_handler(ChatMemberHandler(greet_new_member, ChatMemberHandler.CHAT_MEMBER))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     dp.add_handler(MessageHandler(Filters.sticker, handle_sticker))
 
@@ -1114,7 +1169,7 @@ def main():
     updater.start_polling(
         drop_pending_updates=True,
         timeout=30,
-        allowed_updates=["message", "callback_query", "chat_member"]
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
     )
     updater.idle()
 
