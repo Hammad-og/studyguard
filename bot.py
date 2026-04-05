@@ -140,17 +140,18 @@ def get_thread_id(update: Update):
         return getattr(msg, "message_thread_id", None)
     return None
 
-def safe_reply(update: Update, text: str, reply_markup=None, **kwargs):
+def safe_reply(update: Update, text: str, reply_markup=None, context=None, **kwargs):
     try:
-        msg = update.effective_message
-        chat = update.effective_chat
+        msg       = update.effective_message
+        chat      = update.effective_chat
         thread_id = get_thread_id(update)
         kw = {"parse_mode": ParseMode.MARKDOWN}
         if reply_markup:
             kw["reply_markup"] = reply_markup
-        if thread_id and getattr(chat, "is_forum", False):
+        if thread_id:
             kw["message_thread_id"] = thread_id
-            chat.send_message(text=text, **kw)
+        if context:
+            context.bot.send_message(chat_id=chat.id, text=text, **kw)
         else:
             msg.reply_text(text, **kw)
     except RetryAfter as e:
@@ -350,7 +351,7 @@ def _build_welcome_text(template: str, member, chat) -> str:
 def greet_new_member(update: Update, context: CallbackContext):
     """
     Handles chat_member updates — fires when someone joins a supergroup/topic group.
-    Calls the same welcome logic as new_member.
+    Sends welcome to the correct topic section (thread) where configured, or General.
     """
     try:
         result = update.chat_member
@@ -358,7 +359,6 @@ def greet_new_member(update: Update, context: CallbackContext):
             return
         old_status = result.old_chat_member.status
         new_status = result.new_chat_member.status
-        # Only fire when someone actually joins (was not member, now is member)
         if old_status in ("left", "kicked", "restricted") and new_status == "member":
             member = result.new_chat_member.user
             if member.is_bot:
@@ -384,7 +384,11 @@ def greet_new_member(update: Update, context: CallbackContext):
             media_id   = wcfg.get("media")
             media_type = wcfg.get("media_type")
 
+            # Use saved welcome thread if set, else no thread (goes to General)
+            welcome_thread = wcfg.get("thread_id")
             send_kw = {"parse_mode": ParseMode.MARKDOWN}
+            if welcome_thread:
+                send_kw["message_thread_id"] = welcome_thread
 
             try:
                 if media_id and media_type == "photo":
@@ -431,9 +435,11 @@ def new_member(update: Update, context: CallbackContext):
             media_id   = wcfg.get("media")
             media_type = wcfg.get("media_type")
 
+            wcfg2      = data["welcome_msgs"].get(chat_id, {})
+            welcome_thread = wcfg2.get("thread_id") or thread_id
             send_kw = {"parse_mode": ParseMode.MARKDOWN}
-            if thread_id:
-                send_kw["message_thread_id"] = thread_id
+            if welcome_thread:
+                send_kw["message_thread_id"] = welcome_thread
 
             try:
                 if media_id and media_type == "photo":
@@ -453,10 +459,11 @@ def new_member(update: Update, context: CallbackContext):
 
 def setwelcome(update: Update, context: CallbackContext):
     """
-    /setwelcome off                      – disable welcome
-    /setwelcome <text>                   – set text welcome
+    /setwelcome off                         – disable welcome
+    /setwelcome <text>                      – set text welcome
     /setwelcome <text> (reply to photo/video) – set media welcome
-    Placeholders: {name} {username} {id} {group} {count}
+    Run this command FROM the topic/section where you want welcome msgs to appear.
+    Placeholders: {name} {username} {id} {user_id} {group} {count}
     """
     try:
         if not admin_only(update, context): return
@@ -468,7 +475,7 @@ def setwelcome(update: Update, context: CallbackContext):
         if full_text.strip().lower() == "off":
             data["welcome_off"][chat_id] = True
             save_data()
-            safe_reply(update, "✅ Welcome message *disabled*. Use `/setwelcome <text>` to re-enable.")
+            safe_reply(update, "✅ Welcome message *disabled*. Use `/setwelcome <text>` to re-enable.", context=context)
             return
 
         # Re-enable if was off
@@ -479,10 +486,15 @@ def setwelcome(update: Update, context: CallbackContext):
                 "Usage:\n"
                 "`/setwelcome Hello {name}!` – text welcome\n"
                 "`/setwelcome off` – disable welcome\n\n"
-                "Placeholders: `{name}` `{username}` `{id}` or `{user_id}` `{group}` `{count}`\n"
-                "Reply to a photo/video while using this command to set media welcome."
+                "Placeholders: `{name}` `{username}` `{id}` `{user_id}` `{group}` `{count}`\n"
+                "Reply to a photo/video to attach media to welcome.\n\n"
+                "💡 Run this command *from the section* where you want welcome messages to appear.",
+                context=context
             )
             return
+
+        # Save thread_id of the section this command was sent from
+        thread_id = get_thread_id(update)
 
         # Check for replied media
         replied = update.message.reply_to_message
@@ -502,13 +514,16 @@ def setwelcome(update: Update, context: CallbackContext):
             "text":       full_text,
             "media":      media_id,
             "media_type": media_type,
+            "thread_id":  thread_id,
         }
         save_data()
 
+        section_note = f"\n📍 Welcome will appear in this section." if thread_id else "\n📍 Welcome will appear in General."
         mtype_str = f" + {media_type}" if media_type else ""
         safe_reply(update,
-            f"✅ Welcome message set{mtype_str}!\n\n"
-            f"Preview text:\n{full_text}"
+            f"✅ Welcome message set{mtype_str}!{section_note}\n\n"
+            f"Preview text:\n{full_text}",
+            context=context
         )
     except Exception as e:
         logger.error(f"setwelcome: {e}")
