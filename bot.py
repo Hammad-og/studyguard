@@ -45,6 +45,8 @@ data = {
     "user_names":   {},   # {user_id: str}
     "afk":          {},   # {user_id: {"reason": str, "time": str}}
     "msg_log":      {},   # {chat_id: {thread_id: [msg_id, ...]}}
+    "rules":        {},   # {chat_id: [rule_str, ...]}
+    "staff":        {},   # {chat_id: {user_id: {"name": str, "role": str}}}
 }
 
 DATA_FILE = "studybot_data.json"
@@ -244,31 +246,38 @@ def button_handler(update: Update, context: CallbackContext):
         if query.data == "show_commands":
             text = (
                 "📋 *All Commands*\n\n"
-                "*🛡️ Moderation (Admin)*\n"
-                "`/warn` – Warn user (reply)\n"
-                "`/unwarn` – Remove 1 warn (reply)\n"
+                "*🛡️ Moderation (Admin only)*\n"
+                "`/warn` – Warn user (reply) — 3 warns = auto ban\n"
+                "`/unwarn` – Remove 1 warning (reply)\n"
                 "`/warns` – Check warn count\n"
                 "`/resetwarn` – Reset all warns\n"
-                "`/mute [10m/1h/2d]` – Mute user\n"
+                "`/mute [10m/1h/2d]` – Mute (timed or permanent)\n"
                 "`/unmute` – Unmute user\n"
-                "`/ban` – Ban from group\n"
-                "`/unban @user` – Unban\n\n"
-                "*📚 Study Tools (Admin)*\n"
-                "`/study_mode on/off` – Toggle study mode\n"
-                "`/setwelcome [msg]` – Set welcome text\n"
+                "`/kick` – Kick user from group (reply)\n"
+                "`/ban` – Permanently ban user (reply)\n"
+                "`/unban @user` – Unban a user\n"
+                "`/purge` – Delete msgs from replied msg to latest\n\n"
+                "*📚 Study Tools (Admin only)*\n"
+                "`/study_mode on/off` – Auto-delete off-topic msgs & stickers\n"
+                "`/setwelcome <text>` – Set welcome msg (photo/video supported)\n"
                 "`/setwelcome off` – Disable welcome\n"
-                "`/filter word [reply]` – Add text filter\n"
-                "`/filtersticker word` – Add sticker filter (reply to sticker)\n"
-                "`/rmfilter word` – Remove filter\n"
-                "`/filters` – List all filters\n\n"
+                "`/filter word [reply]` – Auto-delete or auto-reply on keyword\n"
+                "`/filtersticker word` – Reply with sticker on keyword\n"
+                "`/rmfilter word` – Remove a filter\n"
+                "`/filters` – List all active filters\n"
+                "`/setrules <text>` – Set the full group rule book\n\n"
+                "*📖 Rules & 👥 Staff*\n"
+                "`/rules` – Show group rule book\n"
+                "`/staff` – Show staff list\n"
+                "`/staff add @user <role>` – Add to staff (admin)\n"
+                "`/staff remove @user` – Remove from staff (admin)\n\n"
                 "*💤 AFK*\n"
-                "`/afk [reason]` – Go AFK\n\n"
-            "*🗑 Purge (Admin)*\n"
-            "`/purge` – Delete messages from replied msg to latest _(reply to msg)_\n\n"
+                "`/afk [reason]` – Go AFK (auto-unafk when you send a msg)\n\n"
                 "*📊 Everyone*\n"
-                "`/leaderboard` – Top learners\n"
-                "`/report` – Report user (reply)\n"
+                "`/leaderboard` – Top study point earners\n"
+                "`/report` – Report a user to admins (reply)\n"
                 "`/stats` – Group statistics\n"
+                "`/help` – Full command list\n"
             )
             query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb)
 
@@ -986,6 +995,7 @@ def help_cmd(update: Update, context: CallbackContext):
             "`/mute [10m/1h/2d]` – Mute user\n"
             "`/unmute` – Unmute user\n"
             "`/ban` – Ban from group\n"
+            "`/kick` – Kick user _(reply)_\n"
             "`/unban @user` – Unban\n\n"
             "*📚 Study Tools (Admins)*\n"
             "`/study_mode on|off` – Toggle study mode\n"
@@ -1001,6 +1011,13 @@ def help_cmd(update: Update, context: CallbackContext):
             "`/afk [reason]` – Go AFK\n\n"
             "*🗑 Purge (Admin)*\n"
             "`/purge` – Delete messages from replied msg to latest _(reply to msg)_\n\n"
+            "*📖 Rules*\n"
+            "`/setrules <text>` – Set full rule book _(admin)_\n"
+            "`/rules` – Show rule book\n\n"
+            "*👥 Staff*\n"
+            "`/staff` – Show staff list\n"
+            "`/staff add @user <role>` – Add staff _(admin)_\n"
+            "`/staff remove @user` – Remove staff _(admin)_\n\n"
             "*📊 Everyone*\n"
             "`/leaderboard` – Top learners\n"
             "`/report` – Report user _(reply)_\n"
@@ -1235,6 +1252,230 @@ def handle_sticker(update: Update, context: CallbackContext):
         logger.error(f"handle_sticker: {e}")
 
 # ─────────────────────────────────────────────
+#  KICK
+# ─────────────────────────────────────────────
+def kick(update: Update, context: CallbackContext):
+    try:
+        if not admin_only(update, context): return
+        target = update.message.reply_to_message.from_user if update.message.reply_to_message else None
+        if not target:
+            safe_reply(update, "↩️ Reply to the user's message to kick them.", context=context)
+            return
+        if is_admin(update, context, target.id):
+            safe_reply(update, "🚫 Cannot kick an admin.", context=context)
+            return
+        try:
+            context.bot.ban_chat_member(update.effective_chat.id, target.id)
+            context.bot.unban_chat_member(update.effective_chat.id, target.id)
+        except TelegramError as e:
+            safe_reply(update, f"❌ Could not kick: {e}", context=context)
+            return
+        safe_reply(update, f"👟 {user_mention(target)} has been *kicked*.", context=context)
+    except Exception as e:
+        logger.error(f"kick: {e}")
+
+
+# ─────────────────────────────────────────────
+#  RULES
+# ─────────────────────────────────────────────
+def setrules(update: Update, context: CallbackContext):
+    """
+    /setrules <full rules text>
+    Sets the entire rule book in one go. Use real line breaks.
+    Admin only.
+    """
+    try:
+        if not admin_only(update, context): return
+        chat_id = cid(update)
+
+        # Get raw text after command to preserve line breaks
+        raw = update.message.text or ""
+        if " " in raw:
+            rules_text = raw.split(" ", 1)[1].strip()
+        elif "\n" in raw:
+            rules_text = raw.split("\n", 1)[1].strip()
+        else:
+            rules_text = ""
+
+        if not rules_text:
+            safe_reply(update,
+                "Usage: `/setrules <your full rules>`\n\n"
+                "Example:\n"
+                "`/setrules 1. No spamming\n2. Stay on topic\n3. Be respectful`\n\n"
+                "Type the rules directly after the command — line breaks are preserved.",
+                context=context
+            )
+            return
+
+        data["rules"][chat_id] = rules_text
+        save_data()
+        safe_reply(update,
+            "✅ *Rules set!* Members can view with /rules\n\n"
+            f"📖 *Preview:*\n{rules_text}",
+            context=context
+        )
+    except Exception as e:
+        logger.error(f"setrules: {e}")
+
+
+def rules_cmd(update: Update, context: CallbackContext):
+    """
+    /rules — show the group rule book
+    """
+    try:
+        chat_id = cid(update)
+        ensure_chat(data["rules"], chat_id)
+        rules_text = data["rules"].get(chat_id, "")
+
+        if not rules_text:
+            safe_reply(update,
+                "📖 No rules set yet.\nAdmin can set rules with `/setrules <text>`",
+                context=context
+            )
+            return
+
+        safe_reply(update, f"📖 *Group Rules*\n\n{rules_text}", context=context)
+    except Exception as e:
+        logger.error(f"rules_cmd: {e}")
+
+
+# ─────────────────────────────────────────────
+#  STAFF
+# ─────────────────────────────────────────────
+def staff_cmd(update: Update, context: CallbackContext):
+    try:
+        chat_id = cid(update)
+        ensure_chat(data["staff"], chat_id)
+
+        sub = context.args[0].lower() if context.args else ""
+
+        if not sub or sub == "list":
+            staff_dict = data["staff"][chat_id]
+            if not staff_dict:
+                safe_reply(update, "👥 No staff listed yet.\nAdmin can add with `/staff add @user <role>`", context=context)
+                return
+            lines = ["👥 *Staff List*\n"]
+            for u_id, info in staff_dict.items():
+                name = info.get("name", f"User{u_id[:4]}")
+                role = info.get("role", "Staff")
+                lines.append(f"• *{name}* — _{role}_")
+            safe_reply(update, "\n".join(lines), context=context)
+            return
+
+        if sub == "add":
+            if not admin_only(update, context): return
+            target_user = None
+            role = "Staff"
+            if update.message.reply_to_message:
+                target_user = update.message.reply_to_message.from_user
+                role = " ".join(context.args[1:]) if len(context.args) > 1 else "Staff"
+            elif len(context.args) >= 2:
+                username = context.args[1].lstrip("@")
+                role = " ".join(context.args[2:]) if len(context.args) > 2 else "Staff"
+                try:
+                    cm = context.bot.get_chat_member(update.effective_chat.id, f"@{username}")
+                    target_user = cm.user
+                except Exception as e:
+                    safe_reply(update, f"❌ Could not find user: {e}", context=context)
+                    return
+            else:
+                safe_reply(update,
+                    "Usage:\nReply to user + `/staff add <role>`\nor `/staff add @username <role>`",
+                    context=context
+                )
+                return
+            if not target_user:
+                safe_reply(update, "❌ User not found.", context=context)
+                return
+            u_id = str(target_user.id)
+            data["staff"][chat_id][u_id] = {"name": target_user.first_name or "User", "role": role}
+            save_data()
+            safe_reply(update, f"✅ *{target_user.first_name}* added to staff as _{role}_.", context=context)
+            return
+
+        if sub == "remove":
+            if not admin_only(update, context): return
+            target_user = None
+            if update.message.reply_to_message:
+                target_user = update.message.reply_to_message.from_user
+            elif len(context.args) >= 2:
+                username = context.args[1].lstrip("@")
+                try:
+                    cm = context.bot.get_chat_member(update.effective_chat.id, f"@{username}")
+                    target_user = cm.user
+                except Exception as e:
+                    safe_reply(update, f"❌ Could not find user: {e}", context=context)
+                    return
+            else:
+                safe_reply(update, "Reply to user or `/staff remove @username`", context=context)
+                return
+            if not target_user:
+                safe_reply(update, "❌ User not found.", context=context)
+                return
+            u_id = str(target_user.id)
+            if u_id in data["staff"][chat_id]:
+                del data["staff"][chat_id][u_id]
+                save_data()
+                safe_reply(update, f"✅ *{target_user.first_name}* removed from staff.", context=context)
+            else:
+                safe_reply(update, f"❌ {target_user.first_name} is not in staff list.", context=context)
+            return
+
+        safe_reply(update,
+            "Usage:\n"
+            "`/staff` – show staff list\n"
+            "`/staff add @user <role>` – add _(admin)_\n"
+            "`/staff remove @user` – remove _(admin)_",
+            context=context
+        )
+    except Exception as e:
+        logger.error(f"staff_cmd: {e}")
+
+
+# ─────────────────────────────────────────────
+#  OPEN / CLOSE TOPIC  (forum/topic groups only)
+# ─────────────────────────────────────────────
+def close_topic(update: Update, context: CallbackContext):
+    """
+    /closetopic — close/lock the current topic section. Admin only.
+    """
+    try:
+        if not admin_only(update, context): return
+        chat = update.effective_chat
+        thread_id = get_thread_id(update)
+        if not thread_id:
+            safe_reply(update, "❌ This command only works inside a topic section.", context=context)
+            return
+        try:
+            context.bot.close_forum_topic(chat_id=chat.id, message_thread_id=thread_id)
+            safe_reply(update, "🔒 Topic *closed*.", context=context)
+        except TelegramError as e:
+            safe_reply(update, f"❌ Could not close topic: {e}", context=context)
+    except Exception as e:
+        logger.error(f"close_topic: {e}")
+
+
+def open_topic(update: Update, context: CallbackContext):
+    """
+    /opentopic — reopen a closed topic section. Admin only.
+    """
+    try:
+        if not admin_only(update, context): return
+        chat = update.effective_chat
+        thread_id = get_thread_id(update)
+        if not thread_id:
+            safe_reply(update, "❌ This command only works inside a topic section.", context=context)
+            return
+        try:
+            context.bot.reopen_forum_topic(chat_id=chat.id, message_thread_id=thread_id)
+            safe_reply(update, "🔓 Topic *reopened*.", context=context)
+        except TelegramError as e:
+            safe_reply(update, f"❌ Could not open topic: {e}", context=context)
+    except Exception as e:
+        logger.error(f"open_topic: {e}")
+
+
+# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 def main():
@@ -1272,6 +1513,12 @@ def main():
     dp.add_handler(CommandHandler("stats",          stats))
     dp.add_handler(CommandHandler("afk",            afk_cmd))
     dp.add_handler(CommandHandler("purge",           purge))
+    dp.add_handler(CommandHandler("kick",            kick))
+    dp.add_handler(CommandHandler("setrules",        setrules))
+    dp.add_handler(CommandHandler("rules",           rules_cmd))
+    dp.add_handler(CommandHandler("staff",           staff_cmd))
+    dp.add_handler(CommandHandler("closetopic",      close_topic))
+    dp.add_handler(CommandHandler("opentopic",       open_topic))
 
     dp.add_handler(CallbackQueryHandler(button_handler))
     dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, new_member))
