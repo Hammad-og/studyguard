@@ -44,6 +44,7 @@ data = {
     "points":       {},   # {chat_id: {user_id: int}}
     "user_names":   {},   # {user_id: str}
     "afk":          {},   # {user_id: {"reason": str, "time": str}}
+    "msg_log":      {},   # {chat_id: {thread_id: [msg_id, ...]}}
 }
 
 DATA_FILE = "studybot_data.json"
@@ -340,6 +341,7 @@ def _build_welcome_text(template: str, member, chat) -> str:
     except Exception:
         pass
 
+    # Template already has real newlines (raw message text used in setwelcome)
     result = template
     result = result.replace("@{username}", username)
     result = result.replace("{username}",  username)
@@ -471,7 +473,15 @@ def setwelcome(update: Update, context: CallbackContext):
         if not admin_only(update, context): return
         chat_id = cid(update)
 
-        full_text = " ".join(context.args) if context.args else ""
+        # Use raw message text to preserve newlines typed by admin
+        raw = update.message.text or ""
+        # Strip the command part (/setwelcome or /setwelcome@botname)
+        if " " in raw:
+            full_text = raw.split(" ", 1)[1].strip()
+        elif "\n" in raw:
+            full_text = raw.split("\n", 1)[1].strip()
+        else:
+            full_text = ""
 
         # /setwelcome off
         if full_text.strip().lower() == "off":
@@ -1002,12 +1012,12 @@ def help_cmd(update: Update, context: CallbackContext):
         logger.error(f"help_cmd: {e}")
 
 # ─────────────────────────────────────────────
-#  PURGE
+#  PURGE  (thread-aware)
 # ─────────────────────────────────────────────
 def purge(update: Update, context: CallbackContext):
     """
-    /purge — reply to a message, deletes from that msg to latest in this section.
-    Works in normal groups, supergroups, and topic/forum sections.
+    /purge — reply to a message to purge from that point to latest IN THIS SECTION only.
+    Uses msg_log to know exactly which message IDs belong to this thread.
     Admin only.
     """
     try:
@@ -1020,28 +1030,37 @@ def purge(update: Update, context: CallbackContext):
 
         chat      = update.effective_chat
         thread_id = get_thread_id(update)
+        thread_key = str(thread_id or "0")
+        chat_id   = cid(update)
         from_id   = replied.message_id
-        to_id     = update.message.message_id  # the /purge command msg itself
+        to_id     = update.message.message_id
 
-        deleted  = 0
-        failed   = 0
+        ensure_chat(data["msg_log"], chat_id)
+        logged_ids = data["msg_log"][chat_id].get(thread_key, [])
 
-        # Delete from replied msg up to (and including) the /purge command
-        for msg_id in range(from_id, to_id + 1):
+        # Filter: only IDs in this section, within range
+        to_delete = [mid for mid in logged_ids if from_id <= mid <= to_id]
+        # Also add the replied msg and purge cmd itself (may not be in log)
+        to_delete = sorted(set(to_delete + [from_id, to_id]))
+
+        deleted = 0
+        for msg_id in to_delete:
             try:
                 context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
                 deleted += 1
             except BadRequest:
-                # Message doesn't exist or already deleted — skip silently
-                failed += 1
+                pass  # already deleted or not found
             except TelegramError as e:
                 logger.warning(f"purge delete {msg_id}: {e}")
-                failed += 1
             except Exception as e:
                 logger.warning(f"purge unexpected {msg_id}: {e}")
-                failed += 1
 
-        # Send confirmation then auto-delete it after 5s
+        # Clean log — remove deleted IDs
+        data["msg_log"][chat_id][thread_key] = [
+            mid for mid in logged_ids if mid not in to_delete
+        ]
+        save_data()
+
         send_kw = {"parse_mode": ParseMode.MARKDOWN}
         if thread_id:
             send_kw["message_thread_id"] = thread_id
@@ -1050,11 +1069,11 @@ def purge(update: Update, context: CallbackContext):
         try:
             notice = context.bot.send_message(
                 chat_id=chat.id,
-                text=f"🗑 Purged *{deleted}* message(s).",
+                text=f"🗑 Purged *{deleted}* message(s) from this section.",
                 **send_kw
             )
         except Exception as e:
-            logger.warning(f"purge notice send: {e}")
+            logger.warning(f"purge notice: {e}")
 
         if notice:
             try:
@@ -1083,6 +1102,16 @@ def handle_message(update: Update, context: CallbackContext):
 
         u_id = str(user.id)
         data["user_names"][u_id] = user.first_name
+
+        # ── Log message ID for purge (thread-aware) ──
+        thread_key = str(get_thread_id(update) or "0")
+        ensure_chat(data["msg_log"], chat_id)
+        if thread_key not in data["msg_log"][chat_id]:
+            data["msg_log"][chat_id][thread_key] = []
+        data["msg_log"][chat_id][thread_key].append(msg.message_id)
+        # Keep only last 2000 per section to avoid bloat
+        if len(data["msg_log"][chat_id][thread_key]) > 2000:
+            data["msg_log"][chat_id][thread_key] = data["msg_log"][chat_id][thread_key][-2000:]
 
         # ── AFK: sender just sent a message → unafk ──
         if u_id in data["afk"]:
